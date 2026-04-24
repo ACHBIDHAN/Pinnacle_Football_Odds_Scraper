@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# Playwright browser binaries
+playwright/
+
+# Scraper debug output (auto-generated on each run)
+pinnacle_raw_markets.json
+pinnacle_raw_related.json
+
+# Odds output files
+odds_output/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
