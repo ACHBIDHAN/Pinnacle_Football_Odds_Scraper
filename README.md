@@ -1,6 +1,6 @@
 # Pinnacle Football Odds Scraper
 
-Scrapes **all available betting markets** from Pinnacle's soccer match pages and saves them as clean, structured JSON — no API key required.
+Scrapes **all available betting markets** from Pinnacle's football/soccer match pages and saves them as clean, structured JSON — no API key required.
 
 Captures every market visible in the "All" tab: moneyline, Asian handicap (all alternate lines), totals (all lines), team totals, BTTS, double chance, correct score, HT/FT, winning margin, corners, bookings, player props, and more.
 
