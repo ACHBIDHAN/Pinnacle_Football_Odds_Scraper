@@ -1,4 +1,4 @@
-# Pinnacle Odds Scraper
+# Pinnacle Football Odds Scraper
 
 Scrapes **all available betting markets** from Pinnacle's soccer match pages and saves them as clean, structured JSON — no API key required.
 
