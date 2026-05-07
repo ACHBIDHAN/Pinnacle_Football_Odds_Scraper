@@ -20,39 +20,17 @@ from playwright.sync_api import sync_playwright, Response
 # ---------------------------------------------------------------------------
 
 MATCHES_TO_TRACK = [
-    ("Liverpool", "Crystal Palace"),
-    ("Fulham", "Aston Villa"),          # Premier League - 12:30 BST
-("Liverpool", "Crystal Palace"),    # Premier League - 15:00 BST
-("West Ham United", "Everton"),     # Premier League - 15:00 BST
-("Wolverhampton Wanderers", "Tottenham Hotspur"),  # Premier League - 15:00 BST
-("Arsenal", "Newcastle United"),    # Premier League - 17:30 BST
-("Manchester City", "Southampton"), # FA Cup Semi-Final - 17:15 BST (Wembley)
+# Premier League (England)
+("Aston Villa", "Nottingham Forest"),
 
-("Deportivo Alavés", "Mallorca"),  # La Liga - ~13:00 local
-("Getafe", "Barcelona"),            # La Liga - ~15:15 local
-("Valencia", "Girona"),             # La Liga - ~17:30 local
-("Atlético Madrid", "Athletic Bilbao"),  # La Liga - ~20:00 local
 
-("Bologna", "Roma"),                # Serie A (prominent Saturday fixture)
-("Hellas Verona", "Lecce"),         # Serie A
-("Parma", "Pisa"),                  # Serie A
-
-("Mainz 05", "Bayern Munich"),      # Bundesliga (highlight)
-# Additional Bundesliga matches typically kick off simultaneously around 15:30 local (e.g. involving Leverkusen, Dortmund, Leipzig, etc.)
-
-("Angers", "Paris Saint-Germain"),  # Ligue 1 (PSG highlight)
-("Lyon", "Auxerre"),                # Ligue 1
-("Toulouse", "Monaco"),             # Ligue 1
-
-("Benfica", "Moreirense"),          # Primeira Liga - evening highlight
-("Vitória Guimarães", "Rio Ave")    # Primeira Liga
 ]
-
 # ---------------------------------------------------------------------------
 
 OUTPUT_DIR = Path("odds_output")
 RAW_DEBUG_FILE = Path("pinnacle_raw_markets.json")
 RAW_RELATED_DEBUG = Path("pinnacle_raw_related.json")
+RAW_MATCHUPS_DEBUG = Path("pinnacle_raw_matchups.json")
 
 
 # ---------------------------------------------------------------------------
@@ -80,16 +58,29 @@ def scrape_matches(targets: list[tuple[str, str]]) -> tuple[list[dict], list[dic
     all_related: dict[int, list] = {}   # main_matchup_id → related matchup objects
     seen_mkt: set = set()
     captured_api_key: list[str] = []
+    captured_api_base: list[str] = []
+    captured_matchup_headers: list[dict] = []   # exact headers from the browser's matchup call
+
 
     def on_response(response: Response):
         url = response.url
-        if "arcadia.pinnacle.com" not in url:
+        if "pinnacle" not in url:
             return
         try:
             if not captured_api_key:
                 key = response.request.headers.get("x-api-key", "")
                 if key:
                     captured_api_key.append(key)
+            if not captured_api_base:
+                parsed = urlparse(url)
+                if parsed.path.startswith("/0."):   # API path like /0.1/...
+                    base = f"{parsed.scheme}://{parsed.netloc}"
+                    captured_api_base.append(base)
+            # Capture headers from the first matchup call for later API requests
+            if "/matchups" in urlparse(url).path and "/related" not in url:
+                if not captured_matchup_headers:
+                    hdrs = dict(response.request.headers)
+                    captured_matchup_headers.append(hdrs)
 
             path = urlparse(url).path
             body = response.json()
@@ -133,8 +124,26 @@ def scrape_matches(targets: list[tuple[str, str]]) -> tuple[list[dict], list[dic
         page.on("response", on_response)
 
         print("Loading Pinnacle soccer matchups page …")
-        page.goto("https://www.pinnacle.com/en/soccer/matchups/",
-                  wait_until="networkidle", timeout=60_000)
+        for _attempt in range(3):
+            try:
+                page.goto("https://www.pinnacle.ca/en/soccer/matchups/",
+                          wait_until="networkidle", timeout=60_000)
+                break
+            except Exception as _e:
+                if _attempt == 2:
+                    raise
+                print(f"  Retrying after load error: {str(_e).split(chr(10))[0]}")
+                page.wait_for_timeout(3_000)
+        page.wait_for_timeout(3_000)
+
+        # Scroll down repeatedly to trigger lazy-loaded league sections
+        for _ in range(8):
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            page.wait_for_timeout(1_500)
+        try:
+            page.wait_for_load_state("networkidle", timeout=10_000)
+        except Exception:
+            pass
         page.wait_for_timeout(2_000)
 
         seen_ids: set = set()
@@ -144,6 +153,13 @@ def scrape_matches(targets: list[tuple[str, str]]) -> tuple[list[dict], list[dic
             if mid and mid not in seen_ids:
                 seen_ids.add(mid)
                 unique.append(m)
+
+        # Debug: show all captured team names to help diagnose mismatches
+        print(f"\n  All captured matchups ({len(unique)} total):")
+        for mu in sorted(unique, key=lambda x: x.get("startTime", "")):
+            h, a = get_participants(mu)
+            lg = mu.get("league", {}).get("name", "")
+            print(f"    {h or '?'} vs {a or '?'}  [{lg}]")
 
         target_matchups = []
         target_hrefs: dict[int, str] = {}
@@ -159,9 +175,7 @@ def scrape_matches(targets: list[tuple[str, str]]) -> tuple[list[dict], list[dic
 
         for matchup in target_matchups:
             mid = matchup["id"]
-            parts = matchup.get("participants", [])
-            home_name = next((p["name"] for p in parts if p.get("alignment") == "home"), "")
-            away_name = next((p["name"] for p in parts if p.get("alignment") == "away"), "")
+            home_name, away_name = get_participants(matchup)
 
             match_url = _build_match_url(matchup)
             print(f"\n  Opening: {match_url}")
@@ -185,10 +199,113 @@ def scrape_matches(targets: list[tuple[str, str]]) -> tuple[list[dict], list[dic
             page.wait_for_timeout(2_000)
             _click_accordions_by_text(page, home_name, away_name)
 
+        # ── Fallback: query the API directly for any still-missing targets ──
+        def _current_unique() -> list[dict]:
+            seen_tmp: set = set()
+            out: list = []
+            for mu in all_matchups:
+                mid2 = mu.get("id")
+                if mid2 and mid2 not in seen_tmp:
+                    seen_tmp.add(mid2)
+                    out.append(mu)
+            return out
+
+        missing = [
+            (hq, aq) for hq, aq in targets
+            if not find_matchup(unique, hq, aq)
+        ]
+        if missing and captured_api_base and captured_matchup_headers:
+            api_base  = captured_api_base[0]
+            # Use the exact headers the browser sent so the server accepts the request
+            api_headers = captured_matchup_headers[0]
+            print(f"\n  Querying API directly for {len(missing)} missing match(es)…")
+
+            def _api_get(path: str) -> list | None:
+                try:
+                    resp = ctx.request.get(
+                        f"{api_base}{path}",
+                        headers=api_headers,
+                        timeout=25_000,
+                    )
+                    if resp.status == 204:
+                        return []
+                    if not resp.ok:
+                        print(f"    API {resp.status} for {path[:60]}")
+                        return None
+                    data = resp.json()
+                    return data if isinstance(data, list) else []
+                except Exception as e:
+                    print(f"    API call failed ({path[:60]}): {str(e)[:80]}")
+                    return None
+
+            # Step 1: fetch soccer leagues using the correct endpoint format
+            # (browser uses /0.1/sports/29/leagues?all=false for featured, all=true for all)
+            all_leagues = _api_get("/0.1/sports/29/leagues?all=true")
+            if not all_leagues:
+                all_leagues = _api_get("/0.1/leagues?sportId=29") or []
+            print(f"    Leagues retrieved: {len(all_leagues)}")
+
+            LEAGUE_KEYWORDS = [
+                "premier league", "championship", "la liga", "primera",
+                "serie a", "serie b", "segunda", "bundesliga", "ligue 1",
+                "eredivisie", "primeira liga", "super lig",
+            ]
+            target_league_ids = []
+            for lg in (all_leagues if isinstance(all_leagues, list) else []):
+                nm = lg.get("name", "").lower()
+                if any(kw in nm for kw in LEAGUE_KEYWORDS):
+                    target_league_ids.append(lg["id"])
+
+            if not target_league_ids:
+                # Fallback: well-known Pinnacle league IDs for major European leagues
+                target_league_ids = [
+                    2869,   # England - Premier League (pinnacle.ca id — verify)
+                    2196,   # Spain - La Liga
+                    2436,   # Italy - Serie A
+                    1842,   # Germany - Bundesliga
+                    2036,   # France - Ligue 1
+                    1928,   # Netherlands - Eredivisie
+                    2386,   # Portugal - Primeira Liga
+                    1977,   # England - Championship
+                    1843,   # Germany - Bundesliga 2
+                    2432,   # Spain - Segunda Division
+                ]
+                print(f"    Using {len(target_league_ids)} fallback league IDs")
+
+            # Step 2: fetch matchups using correct endpoint: /0.1/leagues/{id}/matchups
+            for lg_id in target_league_ids:
+                result = _api_get(f"/0.1/leagues/{lg_id}/matchups")
+                if result:
+                    all_matchups.extend(result)
+
+            # Re-deduplicate
+            unique[:] = _current_unique()
+            print(f"  After API query: {len(unique)} unique matchups")
+
+            for home_q, away_q in missing:
+                m2 = find_matchup(unique, home_q, away_q)
+                if not m2:
+                    continue
+                hname, aname = get_participants(m2)
+                match_url2 = _build_match_url(m2)
+                print(f"\n  Opening: {match_url2}")
+                try:
+                    page.goto(match_url2, wait_until="domcontentloaded", timeout=45_000)
+                    page.wait_for_timeout(3_000)
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=10_000)
+                    except Exception:
+                        pass
+                except Exception:
+                    continue
+                page.wait_for_timeout(2_000)
+                _click_accordions_by_text(page, hname, aname)
+
         browser.close()
 
     RAW_DEBUG_FILE.write_text(json.dumps(all_markets, indent=2))
     RAW_RELATED_DEBUG.write_text(json.dumps(all_related, indent=2))
+    RAW_MATCHUPS_DEBUG.write_text(json.dumps(all_matchups, indent=2))
 
     type_summary: dict = {}
     for m in all_markets:
@@ -250,14 +367,12 @@ def _click_accordions_by_text(page, home: str, away: str):
 
 
 def _build_match_url(matchup: dict) -> str:
-    parts = matchup.get("participants", [])
-    home = next((p["name"] for p in parts if p.get("alignment") == "home"), "")
-    away = next((p["name"] for p in parts if p.get("alignment") == "away"), "")
+    home, away = get_participants(matchup)
     league = matchup.get("league", {}).get("name", "")
     league_slug = slugify(league.replace(" - ", "-").replace(" – ", "-"))
     mid = matchup["id"]
     return (
-        f"https://www.pinnacle.com/en/soccer/{league_slug}/"
+        f"https://www.pinnacle.ca/en/soccer/{league_slug}/"
         f"{slugify(home)}-vs-{slugify(away)}/{mid}/#all"
     )
 
@@ -266,15 +381,37 @@ def _build_match_url(matchup: dict) -> str:
 # Match finding
 # ---------------------------------------------------------------------------
 
+def get_participants(matchup: dict) -> tuple[str, str]:
+    """Return (home_name, away_name), falling back to array order when alignment is absent."""
+    parts = matchup.get("participants", [])
+    home = next((p["name"] for p in parts if p.get("alignment") == "home"), None)
+    away = next((p["name"] for p in parts if p.get("alignment") == "away"), None)
+    if home is None or away is None:
+        sorted_parts = sorted(parts, key=lambda p: p.get("order", 0))
+        if len(sorted_parts) >= 2:
+            home = home or sorted_parts[0].get("name", "")
+            away = away or sorted_parts[1].get("name", "")
+        elif len(sorted_parts) == 1:
+            home = home or sorted_parts[0].get("name", "")
+            away = away or ""
+    return home or "", away or ""
+
+
 def team_matches(query: str, name: str) -> bool:
     return query.lower().strip() in name.lower()
 
 
 def find_matchup(matchups: list[dict], home_q: str, away_q: str) -> dict | None:
     for m in matchups:
+        # Only consider root head-to-head matchups, not specials/sub-matchups
+        if m.get("type") != "matchup":
+            continue
+        if m.get("parentId") is not None:
+            continue
         parts = m.get("participants", [])
-        home = next((p["name"] for p in parts if p.get("alignment") == "home"), "")
-        away = next((p["name"] for p in parts if p.get("alignment") == "away"), "")
+        if len(parts) != 2:
+            continue
+        home, away = get_participants(m)
         if team_matches(home_q, home) and team_matches(away_q, away):
             return m
         if team_matches(home_q, away) and team_matches(away_q, home):
@@ -401,10 +538,10 @@ def _decode_prices(prices: list[dict], pid_to_name: dict,
 # ---------------------------------------------------------------------------
 
 def parse_match(matchup: dict, markets: list[dict], related_by_id: dict) -> dict:
-    parts = matchup.get("participants", [])
-    home  = next((p["name"] for p in parts if p.get("alignment") == "home"), "Home")
-    away  = next((p["name"] for p in parts if p.get("alignment") == "away"), "Away")
-    mid   = matchup["id"]
+    home, away = get_participants(matchup)
+    home = home or "Home"
+    away = away or "Away"
+    mid  = matchup["id"]
 
     mkt_out: dict = {}   # market_label -> {selection: decimal_odd}
 
@@ -548,15 +685,14 @@ def main():
         m = find_matchup(matchups, home_q, away_q)
         if m:
             found.append(m)
-            parts = m.get("participants", [])
-            h = next((p["name"] for p in parts if p.get("alignment") == "home"), home_q)
-            a = next((p["name"] for p in parts if p.get("alignment") == "away"), away_q)
-            print(f"  [OK] Found: {h} vs {a}")
+            h, a = get_participants(m)
+            print(f"  [OK] Found: {h or home_q} vs {a or away_q}")
         else:
             print(f"  [--] Not listed: {home_q} vs {away_q}")
 
     if not found:
         print("\nNone of the requested matches are on Pinnacle right now.")
+        print("Pinnacle may not have posted odds yet, or these matches have already been played.")
         return
 
     results = [parse_match(m, markets, related) for m in found]
